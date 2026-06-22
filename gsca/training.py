@@ -95,7 +95,23 @@ def train_step(
     optimizer.zero_grad()
 
     # 4. Paso forward
-    feat_2d, feat_3d = model(batch_device['image'], batch_device['point_cloud'])
+    if 'pos' in batch_device and 'batch' in batch_device:
+        feat_2d, feat_3d = model(
+            images=batch_device['image'],
+            coords_2d=batch_device['coords_2d'],
+            pos=batch_device['pos'],
+            batch=batch_device['batch'],
+            K_cam=batch_device['K_cam'],
+            R_prior=batch_device['R_prior'],
+            t_prior=batch_device['t_prior'],
+            normals_2d=batch_device['normals_2d'],
+            normals_3d=batch_device['normals_3d'],
+            delta=batch_device.get('delta', 30.0),
+            tau=batch_device.get('tau', 0.5),
+            near_plane=batch_device.get('near_plane', 0.1),
+        )
+    else:
+        feat_2d, feat_3d = model(batch_device['image'], batch_device['point_cloud'])
     
     # Asegurar que ambos descriptores salgan normalizados L2 en la dimensión C
     feat_2d = F.normalize(feat_2d, p=2, dim=-1)

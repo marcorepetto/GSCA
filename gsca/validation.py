@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Union
+from typing import Dict, Union, Optional, Tuple
 import torch
 
 def degrade_point_cloud(
@@ -171,12 +171,12 @@ def _generate_fbm_noise_2d(
 def apply_visual_degradations(
     image: torch.Tensor, 
     normal_map: torch.Tensor, 
-    albedo_map: torch.Tensor, 
-    sun_azimuth: torch.Tensor, 
-    sun_elevation: torch.Tensor, 
-    roughness_factor: float,
+    albedo_map: Optional[torch.Tensor] = None, 
+    sun_azimuth: torch.Tensor = None, 
+    sun_elevation: torch.Tensor = None, 
+    roughness_factor: float = 0.0,
     return_perturbed_normal: bool = False
-) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Applies physically consistent visual degradations including solar illumination,
     fractal-perturbed normal maps (roughness), weathering on albedo, and stochastic
@@ -185,22 +185,26 @@ def apply_visual_degradations(
     Args:
         image (torch.Tensor): Image tensor of shape [B, 3, H, W] and values in [0.0, 1.0].
         normal_map (torch.Tensor): Normal map of shape [B, 3, H, W] in [-1.0, 1.0].
-        albedo_map (torch.Tensor): Albedo map of shape [B, 3, H, W] in [0.0, 1.0].
+        albedo_map (torch.Tensor, optional): Albedo map of shape [B, 3, H, W] in [0.0, 1.0]. Defaults to image.
         sun_azimuth (torch.Tensor): Solar azimuth angle in degrees of shape [B].
         sun_elevation (torch.Tensor): Solar elevation angle in degrees of shape [B].
         roughness_factor (float): Roughness factor for fractal perturbation (must be >= 0.0).
         return_perturbed_normal (bool): If True, returns the tuple (degraded_image, normal_map_perturbed).
 
     Returns:
-        Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]: Degraded image of shape [B, 3, H, W],
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: Degraded image of shape [B, 3, H, W],
         optionally with the perturbed normal map of shape [B, 3, H, W].
     """
     if not isinstance(image, torch.Tensor):
         raise TypeError("image must be a torch.Tensor")
     if not isinstance(normal_map, torch.Tensor):
         raise TypeError("normal_map must be a torch.Tensor")
-    if not isinstance(albedo_map, torch.Tensor):
+    if albedo_map is not None and not isinstance(albedo_map, torch.Tensor):
         raise TypeError("albedo_map must be a torch.Tensor")
+    if sun_azimuth is None:
+        sun_azimuth = torch.zeros(image.shape[0], device=image.device)
+    if sun_elevation is None:
+        sun_elevation = torch.zeros(image.shape[0], device=image.device)
     if not isinstance(sun_azimuth, torch.Tensor):
         raise TypeError("sun_azimuth must be a torch.Tensor")
     if not isinstance(sun_elevation, torch.Tensor):
@@ -217,8 +221,13 @@ def apply_visual_degradations(
     
     if normal_map.shape != (B, 3, H, W):
         raise ValueError(f"normal_map must have shape [B, 3, H, W], got {list(normal_map.shape)}")
-    if albedo_map.shape != (B, 3, H, W):
-        raise ValueError(f"albedo_map must have shape [B, 3, H, W], got {list(albedo_map.shape)}")
+    
+    if albedo_map is None:
+        albedo_map = image
+    else:
+        if albedo_map.shape != (B, 3, H, W):
+            raise ValueError(f"albedo_map must have shape [B, 3, H, W], got {list(albedo_map.shape)}")
+            
     if sun_azimuth.shape != (B,):
         raise ValueError(f"sun_azimuth must have shape [B], got {list(sun_azimuth.shape)}")
     if sun_elevation.shape != (B,):
