@@ -3,3 +3,10 @@ informe.pdf
 .agents/
 .venv/
 .gemini/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
