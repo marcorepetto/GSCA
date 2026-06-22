@@ -1,0 +1,45 @@
+# GSCA Training Configuration
+
+dry_run: false
+
+data:
+  train_paths: []            # List of specific .pt files or will be populated from train_dir
+  val_paths: []              # List of specific .pt files or will be populated from val_dir
+  train_dir: "data/train"    # Directory containing training .pt samples
+  val_dir: "data/val"        # Directory containing validation .pt samples
+  batch_size: 4
+  num_workers: 0
+  degrade_points: true
+  degrade_visual: true
+  noise_std: 0.03
+  downsample_ratio: 0.8
+  roughness_factor: 0.1
+  pixel_match_threshold: 3.0
+  near_plane: 0.1
+
+model:
+  backbone_name: "dinov2_vits14"
+  bottleneck_dim: 64
+  intermediate_layers: [2, 5, 8, 11]
+  out_channels: 256
+  k: 20
+  pretrained: true
+
+training:
+  epochs: 20
+  device: "cuda"             # Will fallback to cpu if cuda is not available
+  checkpoint_dir: "checkpoints"
+  save_freq: 5
+  val_freq: 1
+  delta: 30.0
+  tau: 0.5
+
+loss:
+  gamma: 80.0
+  margin: 0.25
+
+wandb:
+  project: "gsca-alignment"
+  entity: null
+  name: "gsca_run"
+  log_freq: 10
