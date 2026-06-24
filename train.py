@@ -91,13 +91,10 @@ def generate_dummy_data(tmp_dir: str, num_samples: int = 4) -> List[str]:
     for i in range(num_samples):
         sample_data = {
             'image': torch.rand(3, H, W),
-            'normal_map': torch.nn.functional.normalize(torch.randn(3, H, W), p=2, dim=0),
             'pos': torch.randn(N_3D, 3),
-            'normals_3d': torch.nn.functional.normalize(torch.randn(N_3D, 3), p=2, dim=-1),
             'K_cam': torch.eye(3),
             'pose_gt': torch.eye(4),
             'coords_pixel_2d': torch.rand(N_2D, 2) * (H - 1),
-            'normals_2d': torch.nn.functional.normalize(torch.randn(N_2D, 3), p=2, dim=-1)
         }
         path = os.path.join(tmp_dir, f"dummy_sample_{i}.pt")
         torch.save(sample_data, path)
@@ -142,6 +139,17 @@ def main(cfg: DictConfig) -> None:
             train_paths = [os.path.join(cfg.data.train_dir, f) for f in os.listdir(cfg.data.train_dir) if f.endswith('.pt')]
         if not val_paths and os.path.exists(cfg.data.val_dir):
             val_paths = [os.path.join(cfg.data.val_dir, f) for f in os.listdir(cfg.data.val_dir) if f.endswith('.pt')]
+
+        # Fallback to loading from data/rgb and splitting if still empty
+        if not train_paths and not val_paths:
+            rgb_dir = "data/rgb"
+            if os.path.exists(rgb_dir):
+                all_samples = [os.path.join(rgb_dir, f) for f in sorted(os.listdir(rgb_dir)) if f.endswith('.png')]
+                if len(all_samples) > 0:
+                    split_idx = int(len(all_samples) * 0.9)
+                    train_paths = all_samples[:split_idx]
+                    val_paths = all_samples[split_idx:]
+                    print(f"Split {len(all_samples)} samples from {rgb_dir} into {len(train_paths)} train and {len(val_paths)} val samples.")
 
     if not train_paths:
         raise ValueError("Training sample list is empty. Set data.train_paths or configure a valid data.train_dir.")
@@ -267,8 +275,6 @@ def main(cfg: DictConfig) -> None:
                     K_cam = batch['K_cam'].to(device)
                     R_prior = batch['R_prior'].to(device)
                     t_prior = batch['t_prior'].to(device)
-                    normals_2d = batch['normals_2d'].to(device)
-                    normals_3d = batch['normals_3d'].to(device)
                     
                     feat_2d_refined, feat_3d_dense = model(
                         images=images,
@@ -278,10 +284,7 @@ def main(cfg: DictConfig) -> None:
                         K_cam=K_cam,
                         R_prior=R_prior,
                         t_prior=t_prior,
-                        normals_2d=normals_2d,
-                        normals_3d=normals_3d,
                         delta=cfg.training.delta,
-                        tau=cfg.training.tau,
                         near_plane=cfg.data.near_plane,
                     )
                     

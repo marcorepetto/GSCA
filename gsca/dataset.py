@@ -1,24 +1,28 @@
 import os
+import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Any, Tuple, Optional
+from PIL import Image
+import torchvision.transforms.functional as TF
 
-from gsca.validation import degrade_point_cloud, apply_visual_degradations, synthesize_pose_prior
+from gsca.validation import apply_visual_degradations, degrade_point_cloud, synthesize_pose_prior
 from gsca.models.gsca_matcher import project_points
 
 
 class GSCADataset(Dataset):
     """
     Custom Dataset for the GSCA project.
-    Loads RGB images, normal maps, 2D coordinates, 3D point clouds,
-    camera intrinsics, and ground truth poses.
+    Reads RGB images from data/rgb/ and JSON metadata from data/metadata/.
+    Also loads the 3D model vertices from data/Original.fbx to get the point cloud.
     
-    Optionally applies point cloud and visual degradations for Sim-to-Real training.
+    Optionally applies visual and point cloud degradations for Sim-to-Real training.
     """
 
     def __init__(
         self,
-        sample_paths: List[str],
+        sample_paths: List[str] = None,
+        data_dir: Optional[str] = None,
         degrade_points: bool = False,
         degrade_visual: bool = False,
         noise_std: float = 0.03,
@@ -28,21 +32,9 @@ class GSCADataset(Dataset):
         sun_elevation_range: Tuple[float, float] = (15.0, 75.0),
         pixel_match_threshold: float = 3.0,
         near_plane: float = 0.1,
+        fbx_path: str = "data/Original.fbx",
+        num_points: int = 2048,
     ):
-        """
-        Args:
-            sample_paths: List of file paths to PyTorch saved dictionaries (.pt).
-            degrade_points: Whether to apply point cloud downsampling and noise.
-            degrade_visual: Whether to apply visual solar illumination and roughness.
-            noise_std: Std dev of noise for point cloud degradation.
-            downsample_ratio: Ratio of points to keep in point cloud degradation.
-            roughness_factor: Roughness multiplier for visual degradation.
-            sun_azimuth_range: Range for random sun azimuth (degrees).
-            sun_elevation_range: Range for random sun elevation (degrees).
-            pixel_match_threshold: Pixel distance tolerance to compute matches (gt_mask).
-            near_plane: Near plane clipping distance for point projection.
-        """
-        self.sample_paths = sample_paths
         self.degrade_points = degrade_points
         self.degrade_visual = degrade_visual
         self.noise_std = noise_std
@@ -52,103 +44,236 @@ class GSCADataset(Dataset):
         self.sun_elevation_range = sun_elevation_range
         self.pixel_match_threshold = pixel_match_threshold
         self.near_plane = near_plane
+        self.num_points = num_points
+
+        if sample_paths is not None and len(sample_paths) > 0:
+            self.sample_paths = sample_paths
+        elif data_dir is not None:
+            rgb_dir = os.path.join(data_dir, 'rgb')
+            self.sample_paths = [os.path.join(rgb_dir, f) for f in sorted(os.listdir(rgb_dir)) if f.endswith('.png')]
+        else:
+            raise ValueError("Must provide either sample_paths or data_dir.")
+
+        # Load FBX model if we have at least one .png sample
+        # Resolve FBX path relative to dataset.py if it's not absolute
+        if any(p.endswith('.png') for p in self.sample_paths):
+            actual_fbx_path = fbx_path
+            if not os.path.isabs(actual_fbx_path):
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                actual_fbx_path = os.path.join(project_root, actual_fbx_path)
+            
+            if os.path.exists(actual_fbx_path):
+                from fbxloader import FBXLoader
+                import numpy as np
+                loader = FBXLoader(actual_fbx_path)
+                mesh = loader.export_trimesh()
+                vertices = np.asarray(mesh.vertices, dtype=np.float32)
+                
+                # Simple random downsampling to self.num_points
+                if len(vertices) > self.num_points:
+                    np.random.seed(42)
+                    indices = np.random.choice(len(vertices), self.num_points, replace=False)
+                    vertices = vertices[indices]
+                self.pos = torch.from_numpy(vertices)
+            else:
+                print(f"Warning: FBX model not found at {actual_fbx_path}. Falling back to random points.")
+                self.pos = torch.randn(self.num_points, 3)
+        else:
+            self.pos = None
 
     def __len__(self) -> int:
         return len(self.sample_paths)
 
+    def _quat_to_matrix(self, x: float, y: float, z: float, w: float) -> torch.Tensor:
+        """Converts a quaternion into a 3x3 rotation matrix."""
+        x2, y2, z2 = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+
+        return torch.tensor([
+            [1 - 2*y2 - 2*z2, 2*xy - 2*wz,     2*xz + 2*wy],
+            [2*xy + 2*wz,     1 - 2*x2 - 2*z2, 2*yz - 2*wx],
+            [2*xz - 2*wy,     2*yz + 2*wx,     1 - 2*x2 - 2*y2]
+        ], dtype=torch.float32)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        path = self.sample_paths[idx]
+        img_path = self.sample_paths[idx]
         
-        # Load sample dictionary
-        # Expected keys: 'image', 'normal_map', 'pos', 'normals_3d', 'K_cam', 'pose_gt', 'coords_pixel_2d', 'normals_2d'
-        data = torch.load(path, map_location="cpu")
-        
-        image = data['image'].float()             # [3, H, W] in [0, 1]
-        normal_map = data['normal_map'].float()   # [3, H, W] in [-1, 1]
-        pos = data['pos'].float()                 # [N_3D, 3]
-        normals_3d = data['normals_3d'].float()   # [N_3D, 3]
-        K_cam = data['K_cam'].float()             # [3, 3]
-        pose_gt = data['pose_gt'].float()         # [4, 4]
-        coords_pixel_2d = data['coords_pixel_2d'].float() # [N_2D, 2]
-        normals_2d = data['normals_2d'].float()   # [N_2D, 3]
-        
-        H, W = image.shape[1], image.shape[2]
-
-        # 1. Apply Point Cloud Degradation
-        if self.degrade_points:
-            # degrade_point_cloud expects [B, N, 3]
-            pos_batch = pos.unsqueeze(0)
-            pos_degraded = degrade_point_cloud(
-                pos_batch, 
-                noise_std=self.noise_std, 
-                downsample_ratio=self.downsample_ratio
-            ).squeeze(0)
+        # Legacy .pt format compatibility (for pytest and old datasets)
+        if img_path.endswith('.pt'):
+            data = torch.load(img_path, weights_only=False)
+            image = data['image'].float()
+            pos = data['pos'].float()
+            normals_3d = data.get('normals_3d')
+            if normals_3d is not None:
+                normals_3d = normals_3d.float()
+            normals_2d = data.get('normals_2d')
+            if normals_2d is not None:
+                normals_2d = normals_2d.float()
             
-            # Since point cloud is sub-sampled, sub-sample 3D normals accordingly
-            B, N, _ = pos_batch.shape
-            N_degraded = pos_degraded.shape[0]
-            # Match random indices used in downsampling
-            torch.manual_seed(idx)  # seed matching for consistent downsampling indices
-            indices = torch.randperm(N)[:N_degraded]
-            normals_3d = normals_3d[indices]
-            pos = pos_degraded
-
-        # 2. Apply Visual Degradation
+            # Apply Point Cloud Degradation
+            if self.degrade_points:
+                torch.manual_seed(idx)
+                pos_batch = pos.unsqueeze(0)
+                pos_degraded = degrade_point_cloud(
+                    pos_batch, 
+                    noise_std=self.noise_std, 
+                    downsample_ratio=self.downsample_ratio
+                ).squeeze(0)
+                
+                N_degraded = pos_degraded.shape[0]
+                indices = torch.randperm(pos.shape[0])[:N_degraded]
+                if normals_3d is not None:
+                    normals_3d = normals_3d[indices]
+                pos = pos_degraded
+                
+            K_cam = data['K_cam'].float()
+            pose_gt = data['pose_gt'].float()
+            coords_pixel_2d = data['coords_pixel_2d'].float()
+            
+            pose_prior = synthesize_pose_prior(pose_gt.unsqueeze(0), max_trans=1.0, max_rot_deg=5.0).squeeze(0)
+            R_prior = pose_prior[:3, :3]
+            t_prior = pose_prior[:3, 3:4]
+            sun_direction = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
+            
+            H, W = image.shape[1], image.shape[2]
+            u_norm = (coords_pixel_2d[:, 0] / (W - 1)) * 2.0 - 1.0
+            v_norm = (coords_pixel_2d[:, 1] / (H - 1)) * 2.0 - 1.0
+            coords_2d = torch.stack([u_norm, v_norm], dim=-1)
+            
+            # Project 3D points
+            R_gt = pose_gt[:3, :3].unsqueeze(0)
+            t_gt = pose_gt[:3, 3].unsqueeze(0).unsqueeze(-1)
+            
+            proj_coords, proj_valid_mask = project_points(
+                points_3d=pos.unsqueeze(0),
+                K_cam=K_cam.unsqueeze(0),
+                R_prior=R_gt,
+                t_prior=t_gt,
+                near_plane=self.near_plane
+            )
+            proj_coords = proj_coords.squeeze(0)
+            proj_valid_mask = proj_valid_mask.squeeze(0)
+            
+            dists = torch.cdist(coords_pixel_2d.unsqueeze(0), proj_coords.unsqueeze(0), p=2.0).squeeze(0)
+            gt_mask = dists < self.pixel_match_threshold
+            gt_mask = gt_mask & proj_valid_mask.unsqueeze(0)
+            
+            return {
+                'image': image,
+                'coords_2d': coords_2d,
+                'pos': pos,
+                'normals_3d': normals_3d,
+                'normals_2d': normals_2d,
+                'K_cam': K_cam,
+                'pose_gt': pose_gt,
+                'R_prior': R_prior,
+                't_prior': t_prior,
+                'sun_direction': sun_direction,
+                'gt_mask': gt_mask
+            }
+            
+        filename = os.path.basename(img_path)
+        meta_name = filename.replace('.png', '.json')
+        base_dir = os.path.dirname(os.path.dirname(img_path))
+        meta_path = os.path.join(base_dir, 'metadata', meta_name)
+        
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+            
+        img = Image.open(img_path).convert('RGB')
+        image = TF.to_tensor(img)
+        
         if self.degrade_visual:
-            # Generate random sun azimuth and elevation
             azimuth = torch.FloatTensor(1).uniform_(*self.sun_azimuth_range)
             elevation = torch.FloatTensor(1).uniform_(*self.sun_elevation_range)
             
-            # apply_visual_degradations expects [B, 3, H, W] and sun angles as [B]
             image_batch = image.unsqueeze(0)
-            normal_map_batch = normal_map.unsqueeze(0)
-            
-            # Note: We do NOT pass albedo_map as we do not receive it (fallback uses image)
             image_degraded = apply_visual_degradations(
                 image=image_batch,
-                normal_map=normal_map_batch,
                 albedo_map=None,
                 sun_azimuth=azimuth,
                 sun_elevation=elevation,
                 roughness_factor=self.roughness_factor
             ).squeeze(0)
             image = image_degraded
-
-        # 3. Project 3D points and compute Ground Truth Match Mask (gt_mask)
-        # project_points expects: points_3d: [B, N, 3], K_cam: [B, 3, 3], R_prior/t_prior: [B, 3, 3]/[B, 3, 1]
-        R_gt = pose_gt[:3, :3].unsqueeze(0)
-        t_gt = pose_gt[:3, 3].unsqueeze(0).unsqueeze(-1)
+            
+        # Construct pose_gt
+        rx, ry, rz, rw = meta['rx_gt'], meta['ry_gt'], meta['rz_gt'], meta['rw_gt']
+        R_gt = self._quat_to_matrix(rx, ry, rz, rw)
+        t_gt = torch.tensor([meta['px_gt'], meta['py_gt'], meta['pz_gt']], dtype=torch.float32).unsqueeze(1)
+        pose_gt = torch.eye(4, dtype=torch.float32)
+        pose_gt[:3, :3] = R_gt
+        pose_gt[:3, 3:] = t_gt
+        
+        # Construct pose_prior
+        rx_p, ry_p, rz_p, rw_p = meta['rx_prior'], meta['ry_prior'], meta['rz_prior'], meta['rw_prior']
+        R_prior = self._quat_to_matrix(rx_p, ry_p, rz_p, rw_p)
+        t_prior = torch.tensor([meta['px_prior'], meta['py_prior'], meta['pz_prior']], dtype=torch.float32).unsqueeze(1)
+        
+        # Construct K_cam
+        focal_length = meta['focal_length']
+        cx = meta['cx']
+        cy = meta['cy']
+        K_cam = torch.tensor([
+            [focal_length, 0, cx],
+            [0, focal_length, cy],
+            [0, 0, 1]
+        ], dtype=torch.float32)
+        
+        sun_direction = torch.tensor([
+            meta['sun_direction']['x'],
+            meta['sun_direction']['y'],
+            meta['sun_direction']['z']
+        ], dtype=torch.float32)
+        
+        # Load object 3D point cloud
+        pos = self.pos if self.pos is not None else torch.randn(self.num_points, 3)
+        
+        # 1. Apply Point Cloud Degradation
+        if self.degrade_points:
+            pos_batch = pos.unsqueeze(0)
+            pos_degraded = degrade_point_cloud(
+                pos_batch, 
+                noise_std=self.noise_std, 
+                downsample_ratio=self.downsample_ratio
+            ).squeeze(0)
+            pos = pos_degraded
+            
+        # 2. Project 3D points to image plane to get 2D keypoints and compute gt_mask
+        R_gt_batch = R_gt.unsqueeze(0)
+        t_gt_batch = t_gt.unsqueeze(0)
         
         proj_coords, proj_valid_mask = project_points(
             points_3d=pos.unsqueeze(0),
             K_cam=K_cam.unsqueeze(0),
-            R_prior=R_gt,
-            t_prior=t_gt,
+            R_prior=R_gt_batch,
+            t_prior=t_gt_batch,
             near_plane=self.near_plane
         )
         proj_coords = proj_coords.squeeze(0)          # [N_3D, 2]
         proj_valid_mask = proj_valid_mask.squeeze(0)  # [N_3D]
         
-        # Calculate pairwise distances: [N_2D, N_3D]
-        dists = torch.cdist(coords_pixel_2d.unsqueeze(0), proj_coords.unsqueeze(0), p=2.0).squeeze(0)
+        # Calculate pairwise distances (L2) and ground truth match mask
+        dists = torch.cdist(proj_coords.unsqueeze(0), proj_coords.unsqueeze(0), p=2.0).squeeze(0)
         gt_mask = dists < self.pixel_match_threshold
-        
-        # Mask out coordinates projecting behind camera
         gt_mask = gt_mask & proj_valid_mask.unsqueeze(0)
-
-        # 4. Normalize 2D keypoint coordinates to [-1.0, 1.0] for grid_sample
-        u_norm = (coords_pixel_2d[:, 0] / (W - 1)) * 2.0 - 1.0
-        v_norm = (coords_pixel_2d[:, 1] / (H - 1)) * 2.0 - 1.0
+        
+        # Normalize coordinates to [-1.0, 1.0] for bilinear sampling
+        H, W = image.shape[1], image.shape[2]
+        u_norm = (proj_coords[:, 0] / (W - 1)) * 2.0 - 1.0
+        v_norm = (proj_coords[:, 1] / (H - 1)) * 2.0 - 1.0
         coords_2d = torch.stack([u_norm, v_norm], dim=-1)
-
+        
         return {
             'image': image,
             'coords_2d': coords_2d,
             'pos': pos,
-            'normals_2d': normals_2d,
-            'normals_3d': normals_3d,
             'K_cam': K_cam,
             'pose_gt': pose_gt,
+            'R_prior': R_prior,
+            't_prior': t_prior,
+            'sun_direction': sun_direction,
             'gt_mask': gt_mask
         }
 
@@ -161,28 +286,20 @@ def gsca_collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     B = len(samples)
     
-    # 1. Stack standardized tensors
     images = torch.stack([s['image'] for s in samples], dim=0)
     coords_2d = torch.stack([s['coords_2d'] for s in samples], dim=0)
-    normals_2d = torch.stack([s['normals_2d'] for s in samples], dim=0)
     K_cam = torch.stack([s['K_cam'] for s in samples], dim=0)
     pose_gt = torch.stack([s['pose_gt'] for s in samples], dim=0)
-
-    # 2. Sparse PyG representation of point clouds
-    pos = torch.cat([s['pos'] for s in samples], dim=0)
-    normals_3d = torch.cat([s['normals_3d'] for s in samples], dim=0)
+    R_prior = torch.stack([s['R_prior'] for s in samples], dim=0)
+    t_prior = torch.stack([s['t_prior'] for s in samples], dim=0)
+    sun_direction = torch.stack([s['sun_direction'] for s in samples], dim=0)
     
+    pos = torch.cat([s['pos'] for s in samples], dim=0)
     batch_indices = torch.cat([
         torch.full((s['pos'].shape[0],), idx, dtype=torch.long)
         for idx, s in enumerate(samples)
     ], dim=0)
-
-    # 3. Pose prior synthesis (for the batch)
-    pose_prior = synthesize_pose_prior(pose_gt, max_trans=1.0, max_rot_deg=5.0)
-    R_prior = pose_prior[:, :3, :3]
-    t_prior = pose_prior[:, :3, 3:4]
-
-    # 4. Pad ground truth masks to the maximum number of 3D nodes in the batch
+    
     max_nodes = max(s['pos'].shape[0] for s in samples)
     N_2D = samples[0]['coords_2d'].shape[0]
     
@@ -190,20 +307,26 @@ def gsca_collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     for idx, s in enumerate(samples):
         num_nodes = s['pos'].shape[0]
         gt_mask_padded[idx, :, :num_nodes] = s['gt_mask']
-
-    return {
+        
+    res = {
         'image': images,
         'coords_2d': coords_2d,
         'pos': pos,
         'batch': batch_indices,
         'K_cam': K_cam,
+        'pose_gt': pose_gt,
         'R_prior': R_prior,
         't_prior': t_prior,
-        'normals_2d': normals_2d,
-        'normals_3d': normals_3d,
-        'pose_gt': pose_gt,
+        'sun_direction': sun_direction,
         'gt_mask': gt_mask_padded
     }
+    
+    if 'normals_2d' in samples[0] and samples[0]['normals_2d'] is not None:
+        res['normals_2d'] = torch.stack([s['normals_2d'] for s in samples], dim=0)
+    if 'normals_3d' in samples[0] and samples[0]['normals_3d'] is not None:
+        res['normals_3d'] = torch.cat([s['normals_3d'] for s in samples], dim=0)
+        
+    return res
 
 
 def get_gsca_dataloader(

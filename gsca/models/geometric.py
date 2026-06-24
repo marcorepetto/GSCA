@@ -1,8 +1,55 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import DynamicEdgeConv
 from torch_geometric.utils import scatter
+
+class DynamicEdgeConv(nn.Module):
+    """
+    Custom implementation of DynamicEdgeConv in pure PyTorch
+    to avoid dependency on pyg-lib (which lacks Python 3.13 support).
+    """
+    def __init__(self, nn: nn.Module, k: int, aggr: str = "max"):
+        super().__init__()
+        self.nn_module = nn
+        self.k = k
+        self.aggr = aggr
+
+    def forward(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        batch_ids = torch.unique(batch)
+        outs = []
+        for b_id in batch_ids:
+            mask = (batch == b_id)
+            x_b = x[mask]
+            N_b = x_b.shape[0]
+            
+            # Pairwise distance matrix
+            dists = torch.cdist(x_b.unsqueeze(0), x_b.unsqueeze(0), p=2.0).squeeze(0)
+            
+            # Find k nearest neighbors
+            k_val = min(self.k, N_b)
+            _, nn_idx = torch.topk(dists, k=k_val, dim=-1, largest=False)
+            
+            # Construct edge features
+            x_i = x_b.unsqueeze(1).repeat(1, k_val, 1)
+            x_j = x_b[nn_idx]
+            edge_features = torch.cat([x_i, x_j - x_i], dim=-1)
+            
+            shape = edge_features.shape
+            edge_features_flat = edge_features.view(shape[0] * shape[1], shape[2])
+            
+            edge_feats_mapped = self.nn_module(edge_features_flat)
+            edge_feats_mapped = edge_feats_mapped.view(shape[0], shape[1], -1)
+            
+            if self.aggr == "max":
+                out_b, _ = torch.max(edge_feats_mapped, dim=1)
+            elif self.aggr == "mean":
+                out_b = torch.mean(edge_feats_mapped, dim=1)
+            else:
+                out_b = torch.sum(edge_feats_mapped, dim=1)
+                
+            outs.append(out_b)
+            
+        return torch.cat(outs, dim=0)
 
 class GeometricFeatureExtractor(nn.Module):
     """

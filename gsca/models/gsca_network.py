@@ -53,8 +53,8 @@ class GSCANetwork(nn.Module):
         K_cam: torch.Tensor,
         R_prior: torch.Tensor,
         t_prior: torch.Tensor,
-        normals_2d: torch.Tensor,
-        normals_3d: torch.Tensor,
+        normals_2d: Optional[torch.Tensor] = None,
+        normals_3d: Optional[torch.Tensor] = None,
         delta: float = 30.0,
         tau: float = 0.5,
         near_plane: float = 0.1,
@@ -92,7 +92,10 @@ class GSCANetwork(nn.Module):
         # feat_3d_dense: [B, max_nodes, C], mask_3d: [B, max_nodes]
         feat_3d_dense, mask_3d = to_dense_batch(feat_3d_sparse, batch)
         pos_dense, _ = to_dense_batch(pos, batch)
-        normals_3d_dense, _ = to_dense_batch(normals_3d, batch)
+
+        normals_3d_dense = None
+        if normals_3d is not None:
+            normals_3d_dense, _ = to_dense_batch(normals_3d, batch)
 
         # --- 4. Projection of 3D points into 2D camera coordinates ---
         # proj_coords: [B, max_nodes, 2], proj_valid_mask: [B, max_nodes]

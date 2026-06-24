@@ -4,9 +4,9 @@ import pytest
 
 
 def test_train_script_dry_run():
-    # 1. Retrieve the path to python in the local virtual environment
-    venv_python = os.path.join(os.getcwd(), ".venv", "bin", "python")
-    assert os.path.exists(venv_python), "Virtual environment python binary not found."
+    # 1. Retrieve the path to python running pytest
+    import sys
+    venv_python = sys.executable
 
     train_script = os.path.join(os.getcwd(), "train.py")
     assert os.path.exists(train_script), "train.py script not found."

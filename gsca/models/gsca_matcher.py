@@ -1,5 +1,5 @@
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -88,8 +88,8 @@ class GeoStructuralCrossAttention(nn.Module):
         coords_2d: torch.Tensor,
         proj_coords: torch.Tensor,
         proj_valid_mask: torch.Tensor,
-        normals_2d: torch.Tensor,
-        normals_3d: torch.Tensor,
+        normals_2d: Optional[torch.Tensor] = None,
+        normals_3d: Optional[torch.Tensor] = None,
         delta: float = 30.0,
         tau: float = 0.5
     ) -> torch.Tensor:
@@ -102,8 +102,8 @@ class GeoStructuralCrossAttention(nn.Module):
             coords_2d (torch.Tensor): 2D coordinates (pixel space), shape [B, HW, 2], type torch.float32.
             proj_coords (torch.Tensor): Projected 3D coordinates (pixel space), shape [B, N, 2], type torch.float32.
             proj_valid_mask (torch.Tensor): Validity mask of 3D projections, shape [B, N], type torch.bool.
-            normals_2d (torch.Tensor): 2D unit normals, shape [B, HW, 3], type torch.float32.
-            normals_3d (torch.Tensor): 3D unit normals, shape [B, N, 3], type torch.float32.
+            normals_2d (torch.Tensor, optional): 2D unit normals, shape [B, HW, 3], type torch.float32.
+            normals_3d (torch.Tensor, optional): 3D unit normals, shape [B, N, 3], type torch.float32.
             delta (float): 2D spatial distance threshold (default: 30.0).
             tau (float): Normal vector cosine similarity threshold (default: 0.5).
 
@@ -123,16 +123,17 @@ class GeoStructuralCrossAttention(nn.Module):
         dist = torch.cdist(coords_2d, proj_coords, p=2.0)  # [B, HW, N]
         dist_mask = dist > delta                           # [B, HW, N]
 
-        # Coplanaity / Normal alignment mask
-        # Ensure L2 normalization of normals on dim=-1 (channel dimension)
-        n2d_norm = F.normalize(normals_2d, p=2.0, dim=-1)
-        n3d_norm = F.normalize(normals_3d, p=2.0, dim=-1)
-        cos_normal = torch.bmm(n2d_norm, n3d_norm.transpose(1, 2))  # [B, HW, N]
-        normal_mask = cos_normal < tau                              # [B, HW, N]
-
-        # Combine all boolean masks (invalid when dist > delta OR cos_normal < tau OR projection is invalid)
+        # Combine all boolean masks (invalid when dist > delta OR projection is invalid)
         # proj_valid_mask has shape [B, N], unsqueeze(1) -> [B, 1, N]
-        invalid_mask = dist_mask | normal_mask | (~proj_valid_mask.unsqueeze(1))  # [B, HW, N]
+        invalid_mask = dist_mask | (~proj_valid_mask.unsqueeze(1))  # [B, HW, N]
+
+        # Coplanaity / Normal alignment mask if normals are provided
+        if normals_2d is not None and normals_3d is not None:
+            n2d_norm = F.normalize(normals_2d, p=2.0, dim=-1)
+            n3d_norm = F.normalize(normals_3d, p=2.0, dim=-1)
+            cos_normal = torch.bmm(n2d_norm, n3d_norm.transpose(1, 2))  # [B, HW, N]
+            normal_mask = cos_normal < tau                              # [B, HW, N]
+            invalid_mask = invalid_mask | normal_mask
 
         # Create geo-structural mask with large negative value penalty
         m_geo = torch.zeros_like(attn_logits)

@@ -104,10 +104,7 @@ def train_step(
             K_cam=batch_device['K_cam'],
             R_prior=batch_device['R_prior'],
             t_prior=batch_device['t_prior'],
-            normals_2d=batch_device['normals_2d'],
-            normals_3d=batch_device['normals_3d'],
             delta=batch_device.get('delta', 30.0),
-            tau=batch_device.get('tau', 0.5),
             near_plane=batch_device.get('near_plane', 0.1),
         )
     else:

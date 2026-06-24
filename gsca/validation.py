@@ -170,7 +170,7 @@ def _generate_fbm_noise_2d(
 
 def apply_visual_degradations(
     image: torch.Tensor, 
-    normal_map: torch.Tensor, 
+    normal_map: Optional[torch.Tensor] = None, 
     albedo_map: Optional[torch.Tensor] = None, 
     sun_azimuth: torch.Tensor = None, 
     sun_elevation: torch.Tensor = None, 
@@ -179,12 +179,12 @@ def apply_visual_degradations(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Applies physically consistent visual degradations including solar illumination,
-    fractal-perturbed normal maps (roughness), weathering on albedo, and stochastic
-    white balance.
+    fractal-perturbed normal maps (roughness) if normal_map is provided, weathering on albedo,
+    and stochastic white balance.
 
     Args:
         image (torch.Tensor): Image tensor of shape [B, 3, H, W] and values in [0.0, 1.0].
-        normal_map (torch.Tensor): Normal map of shape [B, 3, H, W] in [-1.0, 1.0].
+        normal_map (torch.Tensor, optional): Normal map of shape [B, 3, H, W] in [-1.0, 1.0].
         albedo_map (torch.Tensor, optional): Albedo map of shape [B, 3, H, W] in [0.0, 1.0]. Defaults to image.
         sun_azimuth (torch.Tensor): Solar azimuth angle in degrees of shape [B].
         sun_elevation (torch.Tensor): Solar elevation angle in degrees of shape [B].
@@ -197,7 +197,7 @@ def apply_visual_degradations(
     """
     if not isinstance(image, torch.Tensor):
         raise TypeError("image must be a torch.Tensor")
-    if not isinstance(normal_map, torch.Tensor):
+    if normal_map is not None and not isinstance(normal_map, torch.Tensor):
         raise TypeError("normal_map must be a torch.Tensor")
     if albedo_map is not None and not isinstance(albedo_map, torch.Tensor):
         raise TypeError("albedo_map must be a torch.Tensor")
@@ -219,9 +219,9 @@ def apply_visual_degradations(
         raise ValueError("image must have shape [B, 3, H, W]")
     B, _, H, W = image.shape
     
-    if normal_map.shape != (B, 3, H, W):
+    if normal_map is not None and normal_map.shape != (B, 3, H, W):
         raise ValueError(f"normal_map must have shape [B, 3, H, W], got {list(normal_map.shape)}")
-    
+        
     if albedo_map is None:
         albedo_map = image
     else:
@@ -244,29 +244,32 @@ def apply_visual_degradations(
     L = torch.stack([Lx, Ly, Lz], dim=1).view(B, 3, 1, 1)
 
     # Generate 2D fractal noise (fBm) for normals and albedo
-    fractal_noise_normal = _generate_fbm_noise_2d(
-        batch_size=B, channels=3, height=H, width=W,
-        device=image.device, dtype=image.dtype
-    )
     fractal_noise_albedo = _generate_fbm_noise_2d(
         batch_size=B, channels=3, height=H, width=W,
         device=image.device, dtype=image.dtype
     )
 
-    # Perturb and normalize normal map
-    normal_map_perturbed = normal_map + roughness_factor * fractal_noise_normal
-    norm = torch.norm(normal_map_perturbed, p=2, dim=1, keepdim=True)
-    normal_map_perturbed = normal_map_perturbed / (norm + 1e-8)
-
-    # Lambertian diffuse lighting term
-    lambertian = torch.sum(normal_map_perturbed * L, dim=1, keepdim=True)
-    lambertian = torch.clamp(lambertian, min=0.0)
-
     # Weathered albedo alteration
     albedo_weathered = albedo_map * (1.0 - 0.2 * fractal_noise_albedo)
 
-    # Compose output image
-    image_degraded = albedo_weathered * lambertian
+    normal_map_perturbed = None
+    if normal_map is not None:
+        fractal_noise_normal = _generate_fbm_noise_2d(
+            batch_size=B, channels=3, height=H, width=W,
+            device=image.device, dtype=image.dtype
+        )
+        # Perturb and normalize normal map
+        normal_map_perturbed = normal_map + roughness_factor * fractal_noise_normal
+        norm = torch.norm(normal_map_perturbed, p=2, dim=1, keepdim=True)
+        normal_map_perturbed = normal_map_perturbed / (norm + 1e-8)
+
+        # Lambertian diffuse lighting term
+        lambertian = torch.sum(normal_map_perturbed * L, dim=1, keepdim=True)
+        lambertian = torch.clamp(lambertian, min=0.0)
+        image_degraded = albedo_weathered * lambertian
+    else:
+        # Compose output image without lighting
+        image_degraded = albedo_weathered
 
     # Stochastic white balance factor [B, 3, 1, 1] in [0.95, 1.05]
     wb_factors = 0.95 + 0.10 * torch.rand(B, 3, 1, 1, device=image.device, dtype=image.dtype)
