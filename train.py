@@ -146,10 +146,14 @@ def main(cfg: DictConfig) -> None:
             if os.path.exists(rgb_dir):
                 all_samples = [os.path.join(rgb_dir, f) for f in sorted(os.listdir(rgb_dir)) if f.endswith('.png')]
                 if len(all_samples) > 0:
+                    import random
+                    random.seed(42)
+                    random.shuffle(all_samples)
+                    
                     split_idx = int(len(all_samples) * 0.9)
                     train_paths = all_samples[:split_idx]
                     val_paths = all_samples[split_idx:]
-                    print(f"Split {len(all_samples)} samples from {rgb_dir} into {len(train_paths)} train and {len(val_paths)} val samples.")
+                    print(f"Split {len(all_samples)} samples from {rgb_dir} randomly (90/10) into {len(train_paths)} train and {len(val_paths)} val samples.")
 
     if not train_paths:
         raise ValueError("Training sample list is empty. Set data.train_paths or configure a valid data.train_dir.")
