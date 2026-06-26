@@ -90,7 +90,7 @@ class GeoStructuralCrossAttention(nn.Module):
         proj_valid_mask: torch.Tensor,
         normals_2d: Optional[torch.Tensor] = None,
         normals_3d: Optional[torch.Tensor] = None,
-        delta: float = 30.0,
+        delta: float = 80.0,
         tau: float = 0.5
     ) -> torch.Tensor:
         """

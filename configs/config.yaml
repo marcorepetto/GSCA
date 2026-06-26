@@ -31,7 +31,7 @@ training:
   checkpoint_dir: "checkpoints"
   save_freq: 5
   val_freq: 1
-  delta: 30.0
+  delta: 80.0
   tau: 0.5
 
 loss:

@@ -74,7 +74,7 @@ class GSCADataset(Dataset):
                     np.random.seed(42)
                     indices = np.random.choice(len(vertices), self.num_points, replace=False)
                     vertices = vertices[indices]
-                self.pos = torch.from_numpy(vertices)
+                self.pos = torch.from_numpy(vertices) * 0.001
             else:
                 print(f"Warning: FBX model not found at {actual_fbx_path}. Falling back to random points.")
                 self.pos = torch.randn(self.num_points, 3)
@@ -198,18 +198,34 @@ class GSCADataset(Dataset):
             ).squeeze(0)
             image = image_degraded
             
-        # Construct pose_gt
+        # R_conv transforms camera coordinates from OpenGL (right/up/back) to OpenCV (right/down/forward)
+        R_conv = torch.tensor([
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0]
+        ], dtype=torch.float32)
+
+        # Construct pose_gt (OpenGL to OpenCV Camera Coordinate Conversion)
         rx, ry, rz, rw = meta['rx_gt'], meta['ry_gt'], meta['rz_gt'], meta['rw_gt']
-        R_gt = self._quat_to_matrix(rx, ry, rz, rw)
-        t_gt = torch.tensor([meta['px_gt'], meta['py_gt'], meta['pz_gt']], dtype=torch.float32).unsqueeze(1)
-        pose_gt = torch.eye(4, dtype=torch.float32)
-        pose_gt[:3, :3] = R_gt
-        pose_gt[:3, 3:] = t_gt
+        R_c2w_gt = self._quat_to_matrix(rx, ry, rz, rw)
+        t_c2w_gt = torch.tensor([meta['px_gt'], meta['py_gt'], meta['pz_gt']], dtype=torch.float32).unsqueeze(1)
         
-        # Construct pose_prior
+        # Compute World-to-Camera (w2c) representation in OpenCV space:
+        # P_cam = R_conv * R_c2w^T * (P_world - t_c2w)
+        R_w2c_gt = torch.matmul(R_conv, R_c2w_gt.t())
+        t_w2c_gt = -torch.matmul(R_w2c_gt, t_c2w_gt)
+        
+        pose_gt = torch.eye(4, dtype=torch.float32)
+        pose_gt[:3, :3] = R_w2c_gt
+        pose_gt[:3, 3:] = t_w2c_gt
+        
+        # Construct pose_prior (OpenGL to OpenCV Camera Coordinate Conversion)
         rx_p, ry_p, rz_p, rw_p = meta['rx_prior'], meta['ry_prior'], meta['rz_prior'], meta['rw_prior']
-        R_prior = self._quat_to_matrix(rx_p, ry_p, rz_p, rw_p)
-        t_prior = torch.tensor([meta['px_prior'], meta['py_prior'], meta['pz_prior']], dtype=torch.float32).unsqueeze(1)
+        R_c2w_prior = self._quat_to_matrix(rx_p, ry_p, rz_p, rw_p)
+        t_c2w_prior = torch.tensor([meta['px_prior'], meta['py_prior'], meta['pz_prior']], dtype=torch.float32).unsqueeze(1)
+        
+        R_w2c_prior = torch.matmul(R_conv, R_c2w_prior.t())
+        t_w2c_prior = -torch.matmul(R_w2c_prior, t_c2w_prior)
         
         # Construct K_cam
         focal_length = meta['focal_length']
@@ -227,7 +243,7 @@ class GSCADataset(Dataset):
             meta['sun_direction']['z']
         ], dtype=torch.float32)
         
-        # Load object 3D point cloud
+        # Load object 3D point cloud (pre-scaled to meters in __init__)
         pos = self.pos if self.pos is not None else torch.randn(self.num_points, 3)
         
         # 1. Apply Point Cloud Degradation
@@ -241,8 +257,8 @@ class GSCADataset(Dataset):
             pos = pos_degraded
             
         # 2. Project 3D points to image plane to get 2D keypoints and compute gt_mask
-        R_gt_batch = R_gt.unsqueeze(0)
-        t_gt_batch = t_gt.unsqueeze(0)
+        R_gt_batch = R_w2c_gt.unsqueeze(0)
+        t_gt_batch = t_w2c_gt.unsqueeze(0)
         
         proj_coords, proj_valid_mask = project_points(
             points_3d=pos.unsqueeze(0),
@@ -271,8 +287,8 @@ class GSCADataset(Dataset):
             'pos': pos,
             'K_cam': K_cam,
             'pose_gt': pose_gt,
-            'R_prior': R_prior,
-            't_prior': t_prior,
+            'R_prior': R_w2c_prior,
+            't_prior': t_w2c_prior,
             'sun_direction': sun_direction,
             'gt_mask': gt_mask
         }

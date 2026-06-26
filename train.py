@@ -227,6 +227,10 @@ def main(cfg: DictConfig) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_val_loss = float('inf')
 
+    import time
+    start_time = time.time()
+    total_steps = epochs * steps_per_epoch
+
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -245,12 +249,28 @@ def main(cfg: DictConfig) -> None:
             
             global_step = (epoch - 1) * steps_per_epoch + step
             if global_step % cfg.wandb.log_freq == 0:
+                elapsed = time.time() - start_time
+                avg_step_time = elapsed / global_step
+                steps_left = total_steps - global_step
+                eta_sec = steps_left * avg_step_time
+
+                hours = int(eta_sec // 3600)
+                minutes = int((eta_sec % 3600) // 60)
+                seconds = int(eta_sec % 60)
+                if hours > 0:
+                    eta_str = f"{hours}h {minutes}m {seconds}s"
+                elif minutes > 0:
+                    eta_str = f"{minutes}m {seconds}s"
+                else:
+                    eta_str = f"{seconds}s"
+
                 wandb.log({
                     "train/loss": stats['loss'],
                     "train/lr": stats['lr'],
-                    "epoch": epoch
+                    "epoch": epoch,
+                    "eta_seconds": eta_sec
                 })
-                print(f"[Epoch {epoch}/{epochs} | Step {step}/{steps_per_epoch}] Loss: {stats['loss']:.4f} | LR: {stats['lr']:.6f}")
+                print(f"[Epoch {epoch}/{epochs} | Step {step}/{steps_per_epoch}] Loss: {stats['loss']:.4f} | LR: {stats['lr']:.6f} | ETA: {eta_str}")
 
         avg_train_loss = epoch_loss / steps_per_epoch
         wandb.log({"train/epoch_loss": avg_train_loss, "epoch": epoch})
@@ -267,6 +287,7 @@ def main(cfg: DictConfig) -> None:
             all_pts_2d = []
             all_pts_3d = []
             all_inlier_masks = []
+            all_K_cam = []
             
             with torch.no_grad():
                 for batch in val_loader:
@@ -325,6 +346,7 @@ def main(cfg: DictConfig) -> None:
                         
                         all_pose_est.append(pose_est)
                         all_pose_gt.append(batch['pose_gt'][b].to(device))
+                        all_K_cam.append(K_cam[b])
                         
                         # Store matches for evaluate_alignment
                         pts_2d_matched = coords_pixel_2d[b][matches[:, 0]]
@@ -357,6 +379,7 @@ def main(cfg: DictConfig) -> None:
                     
                     pose_est_tensor = torch.stack(all_pose_est, dim=0)
                     pose_gt_tensor = torch.stack(all_pose_gt, dim=0)
+                    K_cam_tensor = torch.stack(all_K_cam, dim=0)
                     
                     eval_correspondences = {
                         "pts_2d": pts_2d_pad,
@@ -369,7 +392,7 @@ def main(cfg: DictConfig) -> None:
                         pose_est=pose_est_tensor,
                         pose_gt=pose_gt_tensor,
                         correspondences=eval_correspondences,
-                        intrinsics_K=K_cam
+                        intrinsics_K=K_cam_tensor
                     )
                     
                     avg_rot_err = eval_metrics['rotation_error'].mean().item()

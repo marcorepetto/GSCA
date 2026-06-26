@@ -55,7 +55,7 @@ class GSCANetwork(nn.Module):
         t_prior: torch.Tensor,
         normals_2d: Optional[torch.Tensor] = None,
         normals_3d: Optional[torch.Tensor] = None,
-        delta: float = 30.0,
+        delta: float = 80.0,
         tau: float = 0.5,
         near_plane: float = 0.1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -106,11 +106,20 @@ class GSCANetwork(nn.Module):
         # Combine projection validity with node existence mask
         proj_valid_mask_combined = proj_valid_mask & mask_3d
 
-        # --- 5. Geo-Structural Cross-Attention ---
+        # --- 5. Convert coords_2d to pixel coordinates if they are normalized in [-1, 1] ---
+        if coords_2d.abs().max() <= 1.5:
+            H_img, W_img = images.shape[2], images.shape[3]
+            u_pixel = (coords_2d[..., 0] + 1.0) * (W_img - 1) / 2.0
+            v_pixel = (coords_2d[..., 1] + 1.0) * (H_img - 1) / 2.0
+            coords_pixel = torch.stack([u_pixel, v_pixel], dim=-1)
+        else:
+            coords_pixel = coords_2d
+
+        # --- 6. Geo-Structural Cross-Attention ---
         feat_2d_refined = self.cross_attention(
             feat_2d=feat_2d,
             feat_3d=feat_3d_dense,
-            coords_2d=coords_2d,
+            coords_2d=coords_pixel,
             proj_coords=proj_coords,
             proj_valid_mask=proj_valid_mask_combined,
             normals_2d=normals_2d,
