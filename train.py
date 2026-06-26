@@ -236,6 +236,9 @@ def main(cfg: DictConfig) -> None:
         epoch_loss = 0.0
         
         # Training loop
+        optimizer.zero_grad() # Clean start for the epoch
+        accumulation_steps = 4 # Simulate 4x larger batch size
+        
         for step, batch in enumerate(train_loader, 1):
             stats = train_step(
                 model=model,
@@ -243,7 +246,9 @@ def main(cfg: DictConfig) -> None:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 loss_fn=loss_fn,
-                device=device
+                device=device,
+                step=step,
+                accumulation_steps=accumulation_steps
             )
             epoch_loss += stats['loss']
             

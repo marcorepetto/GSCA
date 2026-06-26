@@ -1,3 +1,4 @@
+import math
 import os
 import json
 import torch
@@ -74,7 +75,24 @@ class GSCADataset(Dataset):
                     np.random.seed(42)
                     indices = np.random.choice(len(vertices), self.num_points, replace=False)
                     vertices = vertices[indices]
-                self.pos = torch.from_numpy(vertices) * 0.001
+                # Scale model to 1% (0.01) and invert the X axis to match OpenGL/OpenCV right-handed coordinates
+                scaled_vertices = torch.from_numpy(vertices) * 0.01
+                scaled_vertices[:, 0] *= -1.0
+                
+                # Unity's Bounds.center is (min + max) / 2.0
+                bbox_center = (scaled_vertices.min(dim=0)[0] + scaled_vertices.max(dim=0)[0]) / 2.0
+                scaled_vertices -= bbox_center
+                
+                # Apply computed pre-alignment matrix to match Unity world space JSON cameras
+                R_align = torch.tensor([
+                    [-0.39660221338272095, -0.8784772157669067, -0.2664293050765991], 
+                    [0.4707551598548889, -0.44379132986068726, 0.7625213861465454], 
+                    [-0.7880966663360596, 0.1769946664571762, 0.5895562171936035]
+                ], dtype=torch.float32)
+                t_align = torch.tensor([-0.18210142850875854, 1.1812915802001953, 0.9816922545433044], dtype=torch.float32)
+                
+                scaled_vertices = torch.matmul(scaled_vertices, R_align) + t_align
+                self.pos = scaled_vertices
             else:
                 print(f"Warning: FBX model not found at {actual_fbx_path}. Falling back to random points.")
                 self.pos = torch.randn(self.num_points, 3)
@@ -83,6 +101,67 @@ class GSCADataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.sample_paths)
+
+    def _quat_to_unity_euler(self, x: float, y: float, z: float, w: float):
+        """Extracts Pitch, Yaw, Roll from Unity quaternion (ZXY order)."""
+        sqw, sqx, sqy, sqz = w*w, x*x, y*y, z*z
+        unit = sqx + sqy + sqz + sqw
+        test = x*w - y*z
+        
+        if test > 0.4995 * unit:
+            pitch = math.pi / 2
+            yaw = 2 * math.atan2(y, x)
+            roll = 0
+        elif test < -0.4995 * unit:
+            pitch = -math.pi / 2
+            yaw = -2 * math.atan2(y, x)
+            roll = 0
+        else:
+            pitch = math.asin(2.0 * (w*x - y*z))
+            yaw = math.atan2(2.0*w*y + 2.0*z*x, 1 - 2.0*(x*x + y*y))
+            roll = math.atan2(2.0*w*z + 2.0*x*y, 1 - 2.0*(z*z + x*x))
+        return pitch, yaw, roll
+
+    def _get_opengl_matrices(self, rx, ry, rz, rw, px, py, pz):
+        """Applies exact markdown transformations for Unity -> OpenGL."""
+        pitch, yaw, roll = self._quat_to_unity_euler(rx, ry, rz, rw)
+        
+        cam_pitch = pitch
+        cam_yaw = -yaw
+        cam_roll = roll
+        
+        # Rx
+        Rx = torch.tensor([
+            [1, 0, 0],
+            [0, math.cos(cam_pitch), -math.sin(cam_pitch)],
+            [0, math.sin(cam_pitch), math.cos(cam_pitch)]
+        ], dtype=torch.float32)
+        # Ry
+        Ry = torch.tensor([
+            [math.cos(cam_yaw), 0, math.sin(cam_yaw)],
+            [0, 1, 0],
+            [-math.sin(cam_yaw), 0, math.cos(cam_yaw)]
+        ], dtype=torch.float32)
+        # Rz
+        Rz = torch.tensor([
+            [math.cos(cam_roll), -math.sin(cam_roll), 0],
+            [math.sin(cam_roll), math.cos(cam_roll), 0],
+            [0, 0, 1]
+        ], dtype=torch.float32)
+        
+        # Composición ZYX: Rz * Ry * Rx
+        R_c2w_gl = torch.matmul(Rz, torch.matmul(Ry, Rx))
+        t_c2w_gl = torch.tensor([-px * 0.01, py * 0.01, pz * 0.01], dtype=torch.float32).unsqueeze(1) # position inversion and scale by 0.01
+        
+        R_w2c_gl = R_c2w_gl.t()
+        t_w2c_gl = -torch.matmul(R_w2c_gl, t_c2w_gl)
+        
+        # Convertir OpenGL (Y-up, Z-back) a OpenCV (Y-down, Z-forward)
+        S_gl2cv = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=torch.float32)
+        R_w2c_cv = torch.matmul(S_gl2cv, R_w2c_gl)
+        t_w2c_cv = torch.matmul(S_gl2cv, t_w2c_gl)
+        
+        return R_w2c_cv, t_w2c_cv.squeeze(1)
 
     def _quat_to_matrix(self, x: float, y: float, z: float, w: float) -> torch.Tensor:
         """Converts a quaternion into a 3x3 rotation matrix."""
@@ -198,34 +277,23 @@ class GSCADataset(Dataset):
             ).squeeze(0)
             image = image_degraded
             
-        # R_conv transforms camera coordinates from OpenGL (right/up/back) to OpenCV (right/down/forward)
-        R_conv = torch.tensor([
-            [1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0, 0.0, -1.0]
-        ], dtype=torch.float32)
-
-        # Construct pose_gt (OpenGL to OpenCV Camera Coordinate Conversion)
+        # Conversion matrices for Unity to OpenCV Camera Coordinate
         rx, ry, rz, rw = meta['rx_gt'], meta['ry_gt'], meta['rz_gt'], meta['rw_gt']
-        R_c2w_gt = self._quat_to_matrix(rx, ry, rz, rw)
-        t_c2w_gt = torch.tensor([meta['px_gt'], meta['py_gt'], meta['pz_gt']], dtype=torch.float32).unsqueeze(1)
-        
-        # Compute World-to-Camera (w2c) representation in OpenCV space:
-        # P_cam = R_conv * R_c2w^T * (P_world - t_c2w)
-        R_w2c_gt = torch.matmul(R_conv, R_c2w_gt.t())
-        t_w2c_gt = -torch.matmul(R_w2c_gt, t_c2w_gt)
+        px, py, pz = meta['px_gt'], meta['py_gt'], meta['pz_gt']
+        R_w2c_gt, t_w2c_gt = self._get_opengl_matrices(rx, ry, rz, rw, px, py, pz)
         
         pose_gt = torch.eye(4, dtype=torch.float32)
         pose_gt[:3, :3] = R_w2c_gt
-        pose_gt[:3, 3:] = t_w2c_gt
+        pose_gt[:3, 3] = t_w2c_gt
         
-        # Construct pose_prior (OpenGL to OpenCV Camera Coordinate Conversion)
+        # Construct pose_prior (Unity to OpenCV Camera Coordinate Conversion)
         rx_p, ry_p, rz_p, rw_p = meta['rx_prior'], meta['ry_prior'], meta['rz_prior'], meta['rw_prior']
-        R_c2w_prior = self._quat_to_matrix(rx_p, ry_p, rz_p, rw_p)
-        t_c2w_prior = torch.tensor([meta['px_prior'], meta['py_prior'], meta['pz_prior']], dtype=torch.float32).unsqueeze(1)
+        px_p, py_p, pz_p = meta['px_prior'], meta['py_prior'], meta['pz_prior']
+        R_w2c_prior, t_w2c_prior = self._get_opengl_matrices(rx_p, ry_p, rz_p, rw_p, px_p, py_p, pz_p)
         
-        R_w2c_prior = torch.matmul(R_conv, R_c2w_prior.t())
-        t_w2c_prior = -torch.matmul(R_w2c_prior, t_c2w_prior)
+        pose_prior = torch.eye(4, dtype=torch.float32)
+        pose_prior[:3, :3] = R_w2c_prior
+        pose_prior[:3, 3] = t_w2c_prior
         
         # Construct K_cam
         focal_length = meta['focal_length']
@@ -237,13 +305,14 @@ class GSCADataset(Dataset):
             [0, 0, 1]
         ], dtype=torch.float32)
         
+        # Invert World X for sun direction as well
         sun_direction = torch.tensor([
-            meta['sun_direction']['x'],
+            -meta['sun_direction']['x'],
             meta['sun_direction']['y'],
             meta['sun_direction']['z']
         ], dtype=torch.float32)
         
-        # Load object 3D point cloud (pre-scaled to meters in __init__)
+        # Load object 3D point cloud
         pos = self.pos if self.pos is not None else torch.randn(self.num_points, 3)
         
         # 1. Apply Point Cloud Degradation
@@ -255,6 +324,38 @@ class GSCADataset(Dataset):
                 downsample_ratio=self.downsample_ratio
             ).squeeze(0)
             pos = pos_degraded
+            
+        # 1.5. Apply Frustum Culling based on prior pose (saves massive VRAM)
+        # Project using the prior pose to see which points might land on screen
+        proj_coords_prior, proj_valid_mask_prior = project_points(
+            points_3d=pos.unsqueeze(0),
+            K_cam=K_cam.unsqueeze(0),
+            R_prior=R_w2c_prior.unsqueeze(0),
+            t_prior=t_w2c_prior.unsqueeze(0),
+            near_plane=self.near_plane
+        )
+        proj_coords_prior = proj_coords_prior.squeeze(0)
+        proj_valid_mask_prior = proj_valid_mask_prior.squeeze(0)
+        
+        # Keep points that are valid (in front of camera) and within a generous margin of the image
+        H, W = image.shape[1], image.shape[2]
+        margin_x = W * 0.5  # generous 50% margin for pose error
+        margin_y = H * 0.5
+        in_frustum_mask = (
+            proj_valid_mask_prior &
+            (proj_coords_prior[:, 0] > -margin_x) & (proj_coords_prior[:, 0] < W + margin_x) &
+            (proj_coords_prior[:, 1] > -margin_y) & (proj_coords_prior[:, 1] < H + margin_y)
+        )
+        
+        # Filter points (if mask is totally empty or too small, keep at least 20 points to avoid BatchNorm crashes in DGCNN)
+        min_points_required = 20
+        if in_frustum_mask.sum() >= min_points_required:
+            pos = pos[in_frustum_mask]
+        else:
+            # Fallback: keep the first 20 points if not enough points fall in frustum
+            # This prevents the [1, C] error in BatchNorm1d
+            fallback_count = min(min_points_required, pos.shape[0])
+            pos = pos[:fallback_count]
             
         # 2. Project 3D points to image plane to get 2D keypoints and compute gt_mask
         R_gt_batch = R_w2c_gt.unsqueeze(0)
@@ -303,7 +404,14 @@ def gsca_collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     B = len(samples)
     
     images = torch.stack([s['image'] for s in samples], dim=0)
-    coords_2d = torch.stack([s['coords_2d'] for s in samples], dim=0)
+    max_nodes = max(s['pos'].shape[0] for s in samples)
+    
+    # Pad coords_2d to [B, max_nodes, 2]
+    coords_2d_padded = torch.zeros(B, max_nodes, 2, dtype=torch.float32)
+    for idx, s in enumerate(samples):
+        num_nodes = s['coords_2d'].shape[0]
+        coords_2d_padded[idx, :num_nodes] = s['coords_2d']
+        
     K_cam = torch.stack([s['K_cam'] for s in samples], dim=0)
     pose_gt = torch.stack([s['pose_gt'] for s in samples], dim=0)
     R_prior = torch.stack([s['R_prior'] for s in samples], dim=0)
@@ -316,17 +424,15 @@ def gsca_collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         for idx, s in enumerate(samples)
     ], dim=0)
     
-    max_nodes = max(s['pos'].shape[0] for s in samples)
-    N_2D = samples[0]['coords_2d'].shape[0]
-    
-    gt_mask_padded = torch.zeros(B, N_2D, max_nodes, dtype=torch.bool)
+    # Pad gt_mask to [B, max_nodes, max_nodes] since N_2D == N_3D in this setup
+    gt_mask_padded = torch.zeros(B, max_nodes, max_nodes, dtype=torch.bool)
     for idx, s in enumerate(samples):
         num_nodes = s['pos'].shape[0]
-        gt_mask_padded[idx, :, :num_nodes] = s['gt_mask']
+        gt_mask_padded[idx, :num_nodes, :num_nodes] = s['gt_mask']
         
     res = {
         'image': images,
-        'coords_2d': coords_2d,
+        'coords_2d': coords_2d_padded,
         'pos': pos,
         'batch': batch_indices,
         'K_cam': K_cam,

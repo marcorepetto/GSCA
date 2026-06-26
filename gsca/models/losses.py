@@ -80,9 +80,9 @@ class CircleLossWithSelfPacedWeighting(nn.Module):
             logits_p = -self.gamma * alpha_p * (s_p - self.delta_p)
             logits_n = self.gamma * alpha_n * (s_n - self.delta_n)
             
-            # Stable logsumexp
-            loss_p = torch.logsumexp(logits_p, dim=0)
-            loss_n = torch.logsumexp(logits_n, dim=0)
+            # Stable logsumexp (normalized by number of pairs to prevent oscillation across batches)
+            loss_p = torch.logsumexp(logits_p, dim=0) - torch.log(torch.tensor(s_p.numel(), dtype=feat_2d.dtype, device=feat_2d.device))
+            loss_n = torch.logsumexp(logits_n, dim=0) - torch.log(torch.tensor(s_n.numel(), dtype=feat_2d.dtype, device=feat_2d.device))
             
             # Stable loss per batch element: log1p(exp(loss_p + loss_n))
             x = loss_p + loss_n

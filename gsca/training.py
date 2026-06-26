@@ -35,7 +35,7 @@ def configure_optimizers(
     # 3. Configuración del Scheduler
     eta_base = 1e-4
     eta_min = 1e-6
-    T_warmup = 5 * steps_per_epoch
+    T_warmup = 1 * steps_per_epoch
     T_max = epochs * steps_per_epoch
 
     def lr_lambda(step):
@@ -65,7 +65,9 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     loss_fn: nn.Module,
-    device: torch.device
+    device: torch.device,
+    step: int = 1,
+    accumulation_steps: int = 1
 ) -> Dict[str, float]:
     """
     Perform a single training step.
@@ -91,40 +93,41 @@ def train_step(
         else:
             batch_device[k] = v
 
-    # 3. Reiniciar gradientes del optimizador
-    optimizer.zero_grad()
+    # 4. Paso forward con Automatic Mixed Precision (AMP) para ahorrar 50% de VRAM
+    with torch.amp.autocast('cuda'):
+        if 'pos' in batch_device and 'batch' in batch_device:
+            feat_2d, feat_3d = model(
+                images=batch_device['image'],
+                coords_2d=batch_device['coords_2d'],
+                pos=batch_device['pos'],
+                batch=batch_device['batch'],
+                K_cam=batch_device['K_cam'],
+                R_prior=batch_device['R_prior'],
+                t_prior=batch_device['t_prior'],
+                delta=batch_device.get('delta', 30.0),
+                near_plane=batch_device.get('near_plane', 0.1),
+            )
+        else:
+            feat_2d, feat_3d = model(batch_device['image'], batch_device['point_cloud'])
+        
+        # Asegurar que ambos descriptores salgan normalizados L2 en la dimensión C
+        feat_2d = F.normalize(feat_2d, p=2, dim=-1)
+        feat_3d = F.normalize(feat_3d, p=2, dim=-1)
 
-    # 4. Paso forward
-    if 'pos' in batch_device and 'batch' in batch_device:
-        feat_2d, feat_3d = model(
-            images=batch_device['image'],
-            coords_2d=batch_device['coords_2d'],
-            pos=batch_device['pos'],
-            batch=batch_device['batch'],
-            K_cam=batch_device['K_cam'],
-            R_prior=batch_device['R_prior'],
-            t_prior=batch_device['t_prior'],
-            delta=batch_device.get('delta', 30.0),
-            near_plane=batch_device.get('near_plane', 0.1),
-        )
-    else:
-        feat_2d, feat_3d = model(batch_device['image'], batch_device['point_cloud'])
-    
-    # Asegurar que ambos descriptores salgan normalizados L2 en la dimensión C
-    feat_2d = F.normalize(feat_2d, p=2, dim=-1)
-    feat_3d = F.normalize(feat_3d, p=2, dim=-1)
-
-    # 5. Evaluar función de pérdida
-    loss = loss_fn(feat_2d, feat_3d, batch_device['gt_mask'])
+        # 5. Evaluar función de pérdida
+        loss = loss_fn(feat_2d, feat_3d, batch_device['gt_mask'])
+        
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / accumulation_steps
 
     # 6. Paso backward
-    loss.backward()
+    scaled_loss.backward()
 
-    # 7. Actualizar parámetros
-    optimizer.step()
-
-    # 8. Actualizar tasa de aprendizaje
-    scheduler.step()
+    # 7. Actualizar parámetros solo cada 'accumulation_steps'
+    if step % accumulation_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        scheduler.step()
 
     # 9. Retornar estadísticas
     # Utilizar .item() para evitar retener el grafo de cómputo y fugas de memoria

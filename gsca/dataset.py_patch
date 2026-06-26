@@ -1,0 +1,118 @@
+--- /home/mrepetto/Documentos/GSCA/gsca/dataset.py
++++ /home/mrepetto/Documentos/GSCA/gsca/dataset.py
+@@ -3,2 +3,3 @@
+ import os
++import math
+ import json
+@@ -89,24 +90,62 @@
+ 
+-    def _quat_to_matrix(self, x: float, y: float, z: float, w: float) -> torch.Tensor:
+-        """Converts a quaternion into a 3x3 rotation matrix."""
+-        x2, y2, z2 = x * x, y * y, z * z
+-        xy, xz, yz = x * y, x * z, y * z
+-        wx, wy, wz = w * x, w * y, w * z
++    def _quat_to_unity_euler(self, x: float, y: float, z: float, w: float):
++        """Extracts Pitch, Yaw, Roll from Unity quaternion (ZXY order)."""
++        sqw, sqx, sqy, sqz = w*w, x*x, y*y, z*z
++        unit = sqx + sqy + sqz + sqw
++        test = x*w - y*z
+         
+-        return torch.tensor([
+-            [1 - 2*y2 - 2*z2, 2*xy - 2*wz,     2*xz + 2*wy],
+-            [2*xy + 2*wz,     1 - 2*x2 - 2*z2, 2*yz - 2*wx],
+-            [2*xz - 2*wy,     2*yz + 2*wx,     1 - 2*x2 - 2*y2]
+-        ], dtype=torch.float32)
++        if test > 0.4995 * unit:
++            pitch = math.pi / 2
++            yaw = 2 * math.atan2(y, x)
++            roll = 0
++        elif test < -0.4995 * unit:
++            pitch = -math.pi / 2
++            yaw = -2 * math.atan2(y, x)
++            roll = 0
++        else:
++            pitch = math.asin(2.0 * (w*x - y*z))
++            yaw = math.atan2(2.0*w*y + 2.0*z*x, 1 - 2.0*(x*x + y*y))
++            roll = math.atan2(2.0*w*z + 2.0*x*y, 1 - 2.0*(z*z + x*x))
++        return pitch, yaw, roll
++
++    def _get_opengl_matrices(self, rx, ry, rz, rw, px, py, pz):
++        """Applies exact markdown transformations for Unity -> OpenGL."""
++        pitch, yaw, roll = self._quat_to_unity_euler(rx, ry, rz, rw)
++        
++        # Transformaciones indicadas en el doc
++        cam_pitch = pitch
++        cam_yaw = -yaw + math.pi
++        cam_roll = roll
++        
++        # Rx
++        Rx = torch.tensor([
++            [1, 0, 0],
++            [0, math.cos(cam_pitch), -math.sin(cam_pitch)],
++            [0, math.sin(cam_pitch), math.cos(cam_pitch)]
++        ], dtype=torch.float32)
++        # Ry
++        Ry = torch.tensor([
++            [math.cos(cam_yaw), 0, math.sin(cam_yaw)],
++            [0, 1, 0],
++            [-math.sin(cam_yaw), 0, math.cos(cam_yaw)]
++        ], dtype=torch.float32)
++        # Rz
++        Rz = torch.tensor([
++            [math.cos(cam_roll), -math.sin(cam_roll), 0],
++            [math.sin(cam_roll), math.cos(cam_roll), 0],
++            [0, 0, 1]
++        ], dtype=torch.float32)
++        
++        # Composición ZYX: Rz * Ry * Rx
++        R_c2w_gl = torch.matmul(Rz, torch.matmul(Ry, Rx))
++        t_c2w_gl = torch.tensor([px, py, pz], dtype=torch.float32).unsqueeze(1)
++        
++        R_w2c_gl = R_c2w_gl.t()
++        t_w2c_gl = -torch.matmul(R_w2c_gl, t_c2w_gl)
++        
++        # Convertir OpenGL (Y-up, Z-back) a OpenCV (Y-down, Z-forward)
++        S_gl2cv = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=torch.float32)
++        R_w2c_cv = torch.matmul(S_gl2cv, R_w2c_gl)
++        t_w2c_cv = torch.matmul(S_gl2cv, t_w2c_gl)
++        
++        return R_w2c_cv, t_w2c_cv.squeeze(1)
+ 
+@@ -194,37 +233,14 @@
+         # Calculate matrices using the required logic
+-        
+-        S_world = torch.tensor([
+-            [-1.0, 0.0, 0.0],
+-            [ 0.0, 1.0, 0.0],
+-            [ 0.0, 0.0, 1.0]
+-        ], dtype=torch.float32)
+-        
+-        S_cam_u2cv = torch.tensor([
+-            [1.0,  0.0, 0.0],
+-            [0.0, -1.0, 0.0],
+-            [0.0,  0.0, 1.0]
+-        ], dtype=torch.float32)
+-        
+         rx, ry, rz, rw = meta['rx_gt'], meta['ry_gt'], meta['rz_gt'], meta['rw_gt']
+-        R_c2w_u_gt = self._quat_to_matrix(rx, ry, rz, rw)
+-        t_c2w_cv_gt = torch.tensor([-meta['px_gt'], meta['py_gt'], meta['pz_gt']], dtype=torch.float32).unsqueeze(1)
+-        
+-        R_c2w_cv_gt = torch.matmul(S_world, torch.matmul(R_c2w_u_gt, S_cam_u2cv))
+-        
+-        R_w2c_gt = R_c2w_cv_gt.t()
+-        t_w2c_gt = -torch.matmul(R_w2c_gt, t_c2w_cv_gt)
+-        t_w2c_gt = t_w2c_gt.squeeze()
++        px, py, pz = meta['px_gt'], meta['py_gt'], meta['pz_gt']
++        R_w2c_gt, t_w2c_gt = self._get_opengl_matrices(rx, ry, rz, rw, px, py, pz)
+ 
+         rx_p, ry_p, rz_p, rw_p = meta['rx_prior'], meta['ry_prior'], meta['rz_prior'], meta['rw_prior']
+-        R_c2w_u_prior = self._quat_to_matrix(rx_p, ry_p, rz_p, rw_p)
+-        t_c2w_cv_prior = torch.tensor([-meta['px_prior'], meta['py_prior'], meta['pz_prior']], dtype=torch.float32).unsqueeze(1)
+-        
+-        R_c2w_cv_prior = torch.matmul(S_world, torch.matmul(R_c2w_u_prior, S_cam_u2cv))
+-        
+-        R_w2c_prior = R_c2w_cv_prior.t()
+-        t_w2c_prior = -torch.matmul(R_w2c_prior, t_c2w_cv_prior)
+-        t_w2c_prior = t_w2c_prior.squeeze()
++        px_p, py_p, pz_p = meta['px_prior'], meta['py_prior'], meta['pz_prior']
++        R_w2c_prior, t_w2c_prior = self._get_opengl_matrices(rx_p, ry_p, rz_p, rw_p, px_p, py_p, pz_p)
