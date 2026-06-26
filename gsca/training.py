@@ -127,7 +127,9 @@ def train_step(
     if step % accumulation_steps == 0:
         optimizer.step()
         optimizer.zero_grad()
-        scheduler.step()
+        
+    # 8. Actualizar la tasa de aprendizaje en TODOS los pasos para que coincida con steps_per_epoch
+    scheduler.step()
 
     # 9. Retornar estadísticas
     # Utilizar .item() para evitar retener el grafo de cómputo y fugas de memoria
